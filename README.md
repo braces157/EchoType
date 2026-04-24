@@ -2,6 +2,8 @@
 
 EchoType is a Windows-first voice-to-text dictation overlay built with Tauri, React, and TypeScript.
 
+![EchoType overlay](image1.png)
+
 ## Features
 
 - Floating glass-style dictation overlay inspired by Windows 11.
