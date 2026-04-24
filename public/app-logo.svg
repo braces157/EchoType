@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">EchoType logo</title>
   <defs>
     <linearGradient id="blue" x1="86" y1="76" x2="412" y2="436" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#1677f2"/>
@@ -8,14 +9,22 @@
       <stop offset="0" stop-color="#33c7e2"/>
       <stop offset="1" stop-color="#1665e7"/>
     </linearGradient>
+    <filter id="softShadow" x="-8%" y="-8%" width="116%" height="116%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#1677f2" flood-opacity=".14"/>
+    </filter>
   </defs>
+
   <rect width="512" height="512" rx="108" fill="#fff"/>
-  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" filter="url(#softShadow)">
     <path d="M242 58h105l92 92v258c0 28-23 51-51 51H187c-28 0-51-23-51-51V109c0-28 23-51 51-51h55Z" stroke="url(#blue)" stroke-width="18"/>
     <path d="M347 62v75c0 12 10 22 22 22h68" stroke="url(#blue)" stroke-width="18"/>
+
     <path d="M334 206h70M334 257h70M334 309h70M316 360h88" stroke="#2ac7e5" stroke-width="16"/>
     <path d="M294 145h66" stroke="#1677f2" stroke-width="16"/>
+
     <path d="M50 238v49M79 210v105M108 181v163" stroke="#2fb7ef" stroke-width="15"/>
+
     <rect x="157" y="142" width="127" height="193" rx="62" fill="url(#mic)" stroke="none"/>
     <path d="M220 334v74M178 408h84M133 249v25c0 48 39 87 87 87s87-39 87-87v-25" stroke="#1169df" stroke-width="18"/>
     <path d="M221 192h53M221 240h53M221 288h53" stroke="#fff" stroke-width="13"/>

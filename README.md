@@ -8,7 +8,8 @@ EchoType is a Windows-first voice-to-text dictation overlay built with Tauri, Re
 - Microphone capture through the webview MediaRecorder API.
 - Configurable language, global keybind, transcription mode, API key, and active-app insertion.
 - Cloud transcription through OpenAI `gpt-4o-mini-transcribe`.
-- Windows text insertion path using `SendInput`, with clipboard fallback.
+- Local transcription through `faster-whisper`.
+- Clipboard-first transcript saving, with optional Windows text insertion using `SendInput`.
 - Browser-safe preview mode for UI development without Tauri.
 
 ## Development
@@ -48,8 +49,39 @@ npm run tauri:build
 - Node.js and npm.
 - Rust and Cargo for Tauri development.
 - Windows WebView2 runtime.
+- Python 3.10+ and `faster-whisper` for local transcription.
 - An OpenAI API key for cloud transcription.
 
-## Current Limitation
+## Local Transcription
 
-The local Windows speech fallback is wired as a backend fallback point, but full offline speech recognition is not implemented yet. Hybrid mode currently attempts OpenAI transcription first and reports a clear fallback error if cloud transcription is unavailable.
+Install the local transcription dependency:
+
+```powershell
+python -m pip install faster-whisper
+```
+
+EchoType uses `base.en` for English and `base` for other languages by default. The model is downloaded once by `faster-whisper` and then reused from the local cache. To use a different local model size, set `ECHOTYPE_WHISPER_MODEL` before launching the app:
+
+```powershell
+$env:ECHOTYPE_WHISPER_MODEL = "tiny.en"
+npm run tauri:dev
+```
+
+Useful local tuning options:
+
+```powershell
+# Faster, lower accuracy
+$env:ECHOTYPE_WHISPER_MODEL = "tiny.en"
+$env:ECHOTYPE_WHISPER_BEAM_SIZE = "1"
+
+# Better English accuracy, slower
+$env:ECHOTYPE_WHISPER_MODEL = "small.en"
+$env:ECHOTYPE_WHISPER_BEAM_SIZE = "1"
+
+# Try this if recordings include long silence
+$env:ECHOTYPE_WHISPER_VAD = "1"
+```
+
+Use **Local only** in settings to avoid OpenAI API usage. Use **Hybrid** to try cloud first and fall back to the local model.
+
+Local mode keeps a Python Whisper worker alive while the app is running. The first transcription after launch can still be slow because it loads the model, but later transcriptions reuse that loaded model.

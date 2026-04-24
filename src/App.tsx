@@ -6,6 +6,7 @@ import {
   GearSix,
   Keyboard,
   Microphone,
+  Minus,
   Pause,
   Play,
   Stop,
@@ -28,6 +29,13 @@ type TranscriptResult = {
   engine: "cloud" | "local" | "mock";
 };
 
+type TranscribePayload = {
+  audioBase64: string;
+  mimeType: string;
+  language: string;
+  mode: AppSettings["transcriptionMode"];
+};
+
 type MicrophoneStatus = {
   available: boolean;
   secureContext: boolean;
@@ -44,7 +52,7 @@ const defaultSettings: AppSettings = {
   transcriptionMode: "hybrid",
   cloudProvider: "openai",
   apiKey: "",
-  autoInsert: true,
+  autoInsert: false,
 };
 
 const languages = [
@@ -66,9 +74,19 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
     if (command === "save_settings") return undefined as T;
     if (command === "register_hotkey") return undefined as T;
     if (command === "reset_webview_permissions") return true as T;
-    if (command === "transcribe_audio") return { text: sampleTranscript, engine: "mock" } as T;
+    if (command === "minimize_overlay") return undefined as T;
+    if (command === "set_overlay_compact") return undefined as T;
+    if (command === "transcribe_audio") {
+      const payload = (args as { request?: TranscribePayload } | undefined)?.request;
+      if (!payload?.audioBase64) throw new Error("Recording was empty. No audio data was captured.");
+      return { text: sampleTranscript, engine: "mock" } as T;
+    }
     if (command === "insert_text") return true as T;
-    if (command === "copy_text") return true as T;
+    if (command === "copy_text") {
+      const text = (args as { text?: string } | undefined)?.text ?? "";
+      await writeBrowserClipboard(text);
+      return true as T;
+    }
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
@@ -90,19 +108,22 @@ function App() {
   const [error, setError] = useState("");
   const [microphoneStatus, setMicrophoneStatus] = useState<MicrophoneStatus | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isCompact, setIsCompact] = useState(false);
   const [isInsertBlocked, setIsInsertBlocked] = useState(false);
   const [hotkeyDraft, setHotkeyDraft] = useState(defaultSettings.hotkey);
   const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+  const sessionRef = useRef(0);
+  const cancelSessionRef = useRef(false);
 
   const statusLabel = useMemo(() => {
-    if (listenState === "listening") return "Listening";
+    if (listenState === "listening") return isCompact ? "Listening..." : "Listening";
     if (listenState === "paused") return "Paused";
     if (listenState === "processing") return "Transcribing";
-    if (listenState === "success") return "Inserted";
+    if (listenState === "success") return settings.autoInsert ? "Inserted" : "Copied";
     if (listenState === "error") return "Needs attention";
     return "Ready";
-  }, [listenState]);
+  }, [isCompact, listenState, settings.autoInsert]);
 
   const statusIcon = listenState === "error" ? <WarningCircle weight="fill" /> : <span className="status-dot" />;
 
@@ -172,11 +193,25 @@ function App() {
     [],
   );
 
+  const setOverlayMode = useCallback(async (compact: boolean) => {
+    setIsCompact(compact);
+    if (isTauriRuntime()) {
+      await invokeCommand("set_overlay_compact", { compact });
+    }
+  }, []);
+
   const stopRecorder = useCallback(() => {
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== "inactive") {
+      if (recorder.state === "recording") {
+        recorder.requestData();
+      }
       recorder.stop();
     }
+  }, []);
+
+  const minimizeOverlay = useCallback(async () => {
+    await invokeCommand("minimize_overlay");
   }, []);
 
   const copyTranscript = useCallback(async () => {
@@ -194,35 +229,52 @@ function App() {
       setError("");
 
       try {
+        if (audioBlob.size < 1200) {
+          throw new Error("Recording was too small to transcribe. Speak for at least one second, then stop again.");
+        }
+
         const base64Audio = await blobToBase64(audioBlob);
         const result = await invokeCommand<TranscriptResult>("transcribe_audio", {
-          audioBase64: base64Audio,
-          language: settings.language,
-          mode: settings.transcriptionMode,
+          request: {
+            audioBase64: base64Audio,
+            mimeType: audioBlob.type || "audio/webm",
+            language: settings.language,
+            mode: settings.transcriptionMode,
+          },
         });
 
         setTranscript(result.text);
         setEngine(result.engine);
+        await copyTextToClipboard(result.text);
 
         if (settings.autoInsert) {
           const inserted = await invokeCommand<boolean>("insert_text", { text: result.text });
           setIsInsertBlocked(!inserted);
           setListenState(inserted ? "success" : "error");
-          if (!inserted) setError("Active app would not accept text. The transcript is ready to copy.");
+          if (!inserted) setError("Saved to clipboard. Active app would not accept typed text.");
         } else {
           setListenState("success");
         }
+
+        if (isCompact) void setOverlayMode(false);
       } catch (cause) {
         setListenState("error");
-        setError(cause instanceof Error ? cause.message : "Transcription failed.");
+        if (isCompact) void setOverlayMode(false);
+        setError(formatUnknownError(cause, "Transcription failed."));
       }
     },
-    [settings.autoInsert, settings.language, settings.transcriptionMode],
+    [isCompact, setOverlayMode, settings.autoInsert, settings.language, settings.transcriptionMode],
   );
 
   const startListening = useCallback(async () => {
     if (listenState === "listening") {
       stopRecorder();
+      return;
+    }
+
+    if (listenState === "paused") {
+      pauseRecorder(recorderRef.current);
+      setListenState("listening");
       return;
     }
 
@@ -239,7 +291,10 @@ function App() {
       setTranscript("");
       setError("");
       setIsInsertBlocked(false);
-      chunksRef.current = [];
+      cancelSessionRef.current = false;
+      sessionRef.current += 1;
+      const sessionId = sessionRef.current;
+      const chunks: BlobPart[] = [];
 
       await refreshMicrophoneStatus();
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -249,20 +304,32 @@ function App() {
           autoGainControl: true,
         },
       });
-      const recorder = new MediaRecorder(stream);
+      const mimeType = getSupportedAudioMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       recorderRef.current = recorder;
+      streamRef.current = stream;
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+
+      recorder.onerror = () => {
+        cancelSessionRef.current = true;
+        setListenState("error");
+        setError("The recorder stopped because WebView2 reported a microphone capture error.");
       };
 
       recorder.onstop = () => {
         stream.getTracks().forEach((track) => track.stop());
-        const audioBlob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        if (recorderRef.current === recorder) recorderRef.current = null;
+        if (streamRef.current === stream) streamRef.current = null;
+        if (cancelSessionRef.current || sessionRef.current !== sessionId) return;
+
+        const audioBlob = new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" });
         void processAudio(audioBlob);
       };
 
-      recorder.start();
+      recorder.start(250);
       setListenState("listening");
     } catch (cause) {
       setListenState("error");
@@ -286,56 +353,65 @@ function App() {
 
     let unlisten: (() => void) | undefined;
     import("@tauri-apps/api/event")
-      .then(({ listen }) => listen("hotkey-triggered", () => void startListening()))
+      .then(({ listen }) =>
+        listen("hotkey-triggered", async () => {
+          await setOverlayMode(true);
+          await startListening();
+        }),
+      )
       .then((cleanup) => {
         unlisten = cleanup;
       })
       .catch(() => undefined);
 
     return () => unlisten?.();
-  }, [startListening]);
+  }, [setOverlayMode, startListening]);
 
   const pauseListening = useCallback(() => {
-    const recorder = recorderRef.current;
-    if (!recorder) return;
-
-    if (recorder.state === "recording") {
-      recorder.pause();
+    if (pauseRecorder(recorderRef.current)) {
       setListenState("paused");
       return;
     }
 
-    if (recorder.state === "paused") {
-      recorder.resume();
+    if (resumeRecorder(recorderRef.current)) {
       setListenState("listening");
     }
   }, []);
 
   const reset = useCallback(() => {
-    recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
+    void setOverlayMode(false);
+    cancelSessionRef.current = true;
+    sessionRef.current += 1;
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      recorderRef.current.stop();
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    recorderRef.current = null;
+    streamRef.current = null;
     setListenState("idle");
     setSeconds(0);
     setTranscript("");
     setError("");
     setIsInsertBlocked(false);
-  }, []);
+  }, [setOverlayMode]);
 
   const applyHotkeyDraft = useCallback(async () => {
     await saveSettings({ ...settings, hotkey: hotkeyDraft.trim() || defaultSettings.hotkey });
   }, [hotkeyDraft, saveSettings, settings]);
 
   const openSettings = useCallback(() => {
+    void setOverlayMode(false);
     setIsSettingsOpen(true);
     void refreshMicrophoneStatus();
-  }, [refreshMicrophoneStatus]);
+  }, [refreshMicrophoneStatus, setOverlayMode]);
 
   return (
-    <main className="desktop-shell">
-      <section className="overlay-card" aria-label="EchoType dictation overlay">
+    <main className={`desktop-shell ${isCompact ? "compact-shell" : ""}`}>
+      <section className={`overlay-card ${isCompact ? "compact" : ""}`} aria-label="EchoType dictation overlay">
         <header className="overlay-header">
           <div className="brand-lockup">
             <div className="brand-mark">
-              <Microphone weight="fill" />
+              <img src="/app-logo.svg" alt="" />
             </div>
             <strong>
               Echo<span>Type</span>
@@ -345,11 +421,18 @@ function App() {
           <div className={`status-pill ${listenState}`}>
             {statusIcon}
             <span>{statusLabel}</span>
+            {isCompact && listenState === "listening" && <i aria-hidden="true" />}
           </div>
 
           <button className="shortcut-pill" type="button" onClick={openSettings}>
             {settings.hotkey}
           </button>
+
+          {!isCompact && (
+            <button className="icon-button subtle" type="button" aria-label="Minimize overlay" onClick={minimizeOverlay}>
+              <Minus weight="bold" />
+            </button>
+          )}
 
           <button className="icon-button subtle" type="button" aria-label="Close overlay" onClick={reset}>
             <X weight="bold" />
@@ -369,7 +452,7 @@ function App() {
           <div className="transcription-panel">
             <Waveform active={listenState === "listening" || listenState === "processing"} />
             <p className={`transcript-preview ${transcript ? "has-text" : ""}`}>
-              {transcript || (listenState === "idle" ? "Press the shortcut or microphone to dictate..." : "Speak naturally. EchoType is capturing your voice.")}
+              {transcript || getPreviewText(listenState)}
             </p>
             <div className="meta-row">
               <span>{selectedLanguage}</span>
@@ -414,7 +497,7 @@ function App() {
         {listenState === "success" && !error && (
           <div className="notice success">
             <CheckCircle weight="fill" />
-            <span>{settings.autoInsert ? "Transcript sent to the active app." : "Transcript is ready."}</span>
+            <span>{settings.autoInsert ? "Transcript copied and sent to the active app." : "Transcript copied to clipboard."}</span>
           </div>
         )}
       </section>
@@ -479,7 +562,7 @@ function App() {
             <label className="toggle-row wide">
               <span>
                 <strong>Type into active app</strong>
-                <small>When disabled, EchoType keeps the transcript in the overlay for copying.</small>
+                <small>EchoType always saves to clipboard first. Enable this to also type into the active app.</small>
               </span>
               <input
                 type="checkbox"
@@ -516,6 +599,72 @@ function Waveform({ active }: { active: boolean }) {
   );
 }
 
+async function copyTextToClipboard(text: string) {
+  try {
+    await invokeCommand("copy_text", { text });
+  } catch {
+    await writeBrowserClipboard(text);
+  }
+}
+
+async function writeBrowserClipboard(text: string) {
+  if (!text) {
+    throw new Error("There is no transcript text to copy.");
+  }
+
+  try {
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Fall back to the selection API below. Some browser previews reject async
+    // clipboard writes after transcription because the user gesture has ended.
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+
+  if (!copied) {
+    throw new Error("Clipboard write was blocked by the browser. Use the Copy button after transcription.");
+  }
+}
+
+function getSupportedAudioMimeType() {
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/wav"];
+  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? "";
+}
+
+function pauseRecorder(recorder: MediaRecorder | null) {
+  if (!recorder || recorder.state !== "recording") return false;
+  recorder.pause();
+  return true;
+}
+
+function resumeRecorder(recorder: MediaRecorder | null) {
+  if (!recorder || recorder.state !== "paused") return false;
+  recorder.resume();
+  return true;
+}
+
+function getPreviewText(listenState: ListenState) {
+  if (listenState === "idle") return "Press the shortcut or microphone to dictate...";
+  if (listenState === "processing") return "Transcribing your recording...";
+  if (listenState === "error") return "Review the message below, then try again.";
+  if (listenState === "paused") return "Recording is paused.";
+  return "Speak naturally. EchoType is capturing your voice.";
+}
+
 async function blobToBase64(blob: Blob) {
   const buffer = await blob.arrayBuffer();
   let binary = "";
@@ -548,6 +697,16 @@ function getMicrophoneErrorMessage(cause: unknown) {
   }
 
   return `${cause.name}: ${cause.message}`;
+}
+
+function formatUnknownError(cause: unknown, fallback: string) {
+  if (cause instanceof Error) return cause.message;
+  if (typeof cause === "string") return cause;
+  try {
+    return JSON.stringify(cause);
+  } catch {
+    return fallback;
+  }
 }
 
 export default App;
