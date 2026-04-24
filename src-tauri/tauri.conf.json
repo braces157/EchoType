@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EchoType",
+  "version": "0.1.0",
+  "identifier": "com.echotype.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "EchoType",
+        "width": 920,
+        "height": 420,
+        "minWidth": 360,
+        "minHeight": 280,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "center": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  }
+}

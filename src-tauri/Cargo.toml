@@ -1,0 +1,29 @@
+[package]
+name = "echotype"
+version = "0.1.0"
+description = "A Windows voice-to-text dictation overlay."
+authors = ["EchoType"]
+edition = "2021"
+
+[lib]
+name = "echotype_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arboard = "3"
+base64 = "0.22"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+thiserror = "2"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging"
+] }
