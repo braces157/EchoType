@@ -784,6 +784,7 @@ fn local_language_code(language: &str) -> String {
         "auto" => "auto".to_string(),
         "en-US" | "en-GB" => "en".to_string(),
         "th-TH" => "th".to_string(),
+        "vi-VN" => "vi".to_string(),
         other => other
             .split(['-', '_'])
             .next()
@@ -798,6 +799,7 @@ fn openai_language_code(language: &str) -> Option<String> {
         "auto" => None,
         "en-US" | "en-GB" => Some("en".to_string()),
         "th-TH" => Some("th".to_string()),
+        "vi-VN" => Some("vi".to_string()),
         other => other
             .split(['-', '_'])
             .next()

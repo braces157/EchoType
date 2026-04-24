@@ -75,7 +75,7 @@ def worker() -> int:
         try:
             request = json.loads(line)
             text = transcribe(request["audioFile"], request.get("language", "auto"))
-            print(json.dumps({"ok": True, "text": text}, ensure_ascii=False), flush=True)
+            print(json.dumps({"ok": True, "text": text}), flush=True)
         except Exception as error:
             print(json.dumps({"ok": False, "error": str(error)}), flush=True)
 
@@ -110,7 +110,7 @@ def main() -> int:
         print(f"Local Whisper transcription failed: {error}", file=sys.stderr)
         return 1
 
-    print(json.dumps({"text": text}, ensure_ascii=False))
+    print(json.dumps({"text": text}))
     return 0
 
 

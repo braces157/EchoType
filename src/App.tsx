@@ -59,6 +59,7 @@ const languages = [
   { label: "English (US)", value: "en-US" },
   { label: "English (UK)", value: "en-GB" },
   { label: "Thai", value: "th-TH" },
+  { label: "Vietnamese", value: "vi-VN" },
   { label: "Auto detect", value: "auto" },
 ];
 
@@ -485,6 +486,11 @@ function App() {
     setIsInsertBlocked(false);
   }, [setOverlayMode]);
 
+  const closeOverlay = useCallback(() => {
+    reset();
+    void minimizeOverlay();
+  }, [minimizeOverlay, reset]);
+
   const applyHotkeyDraft = useCallback(async () => {
     const nextHotkey = hotkeyDraft.trim() || defaultSettings.hotkey;
     if (!isSupportedHotkey(nextHotkey)) {
@@ -562,7 +568,7 @@ function App() {
             </button>
           )}
 
-          <button className="icon-button subtle" type="button" aria-label="Close overlay" onClick={reset}>
+          <button className="icon-button subtle" type="button" aria-label="Close overlay" onClick={closeOverlay}>
             <X weight="bold" />
           </button>
         </header>
