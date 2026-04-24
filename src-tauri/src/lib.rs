@@ -8,23 +8,25 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{menu::MenuBuilder, tray::TrayIconBuilder};
+use tauri::{
+    menu::MenuBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
+    Foundation::HWND,
     UI::{
         Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
             KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
         },
-        WindowsAndMessaging::{
-            GetForegroundWindow, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CHAR,
-        },
+        WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow, ShowWindow, SW_RESTORE},
     },
 };
 
@@ -67,6 +69,7 @@ struct AppState {
     target_window: Mutex<Option<isize>>,
     current_shortcut: Mutex<Option<Shortcut>>,
     local_worker: Mutex<Option<LocalWhisperWorker>>,
+    last_hotkey_at: Mutex<Option<Instant>>,
 }
 
 struct LocalWhisperWorker {
@@ -81,16 +84,9 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        #[cfg(target_os = "windows")]
-                        {
-                            let hwnd = unsafe { GetForegroundWindow() };
-                            let state = app.state::<AppState>();
-                            let mut target = state.target_window.lock().ok();
-                            if let Some(target) = target.as_mut() {
-                                target.replace(hwnd.0 as isize);
-                            };
+                        if !should_handle_hotkey(app) {
+                            return;
                         }
-                        let _ = restore_overlay_window(app);
                         let _ = app.emit("hotkey-triggered", ());
                     }
                 })
@@ -111,6 +107,7 @@ pub fn run() {
             register_hotkey,
             capture_active_window,
             reset_webview_permissions,
+            show_overlay,
             minimize_overlay,
             set_overlay_compact,
             transcribe_audio,
@@ -132,14 +129,32 @@ fn setup_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let mut tray_builder = TrayIconBuilder::with_id("echotype-tray")
         .tooltip("EchoType")
         .menu(&tray_menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
             if event.id() == "show" {
-                let _ = restore_overlay_window(app);
+                let _ = show_normal_overlay(app);
             } else if event.id() == "minimize" {
                 let _ = minimize_main_window(app);
             } else if event.id() == "quit" {
                 app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) || matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Down,
+                    ..
+                }
+            ) {
+                let _ = show_normal_overlay(tray.app_handle());
             }
         });
 
@@ -149,6 +164,23 @@ fn setup_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
 
     tray_builder.build(app)?;
     Ok(())
+}
+
+fn should_handle_hotkey(app: &AppHandle) -> bool {
+    const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(260);
+
+    let state = app.state::<AppState>();
+    let Ok(mut last_hotkey_at) = state.last_hotkey_at.lock() else {
+        return false;
+    };
+
+    let now = Instant::now();
+    if last_hotkey_at.is_some_and(|previous| now.duration_since(previous) < HOTKEY_DEBOUNCE) {
+        return false;
+    }
+
+    *last_hotkey_at = Some(now);
+    true
 }
 
 #[tauri::command]
@@ -182,35 +214,26 @@ fn register_hotkey(app: AppHandle, state: State<AppState>, hotkey: String) -> Re
         .lock()
         .map_err(|_| "Shortcut state could not be locked.".to_string())?;
 
-    if let Some(existing) = current.take() {
-        let _ = manager.unregister(existing);
+    if current.as_ref() == Some(&shortcut) {
+        return Ok(());
     }
 
     manager
         .register(shortcut)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Could not register shortcut: {error}"))?;
+
+    if let Some(existing) = current.take() {
+        let _ = manager.unregister(existing);
+    }
+
     *current = Some(shortcut);
     Ok(())
 }
 
 #[tauri::command]
-fn capture_active_window(state: State<AppState>) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let hwnd = unsafe { GetForegroundWindow() };
-        let mut target = state
-            .target_window
-            .lock()
-            .map_err(|_| "Window state could not be locked.".to_string())?;
-        target.replace(hwnd.0 as isize);
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = state;
-        Ok(())
-    }
+fn capture_active_window(app: AppHandle) -> Result<(), String> {
+    remember_foreground_target(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -246,17 +269,37 @@ fn reset_webview_permissions() -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn show_overlay(app: AppHandle) -> Result<(), String> {
+    restore_overlay_window(&app).map(|_| ())
+}
+
+fn show_normal_overlay(app: &AppHandle) -> Result<(), String> {
+    let window = restore_overlay_window(app)?;
+    window
+        .set_size(Size::Logical(LogicalSize {
+            width: 920.0,
+            height: 420.0,
+        }))
+        .map_err(|error| error.to_string())?;
+    window.center().map_err(|error| error.to_string())?;
+    let _ = app.emit("show-normal-overlay", ());
+    Ok(())
+}
+
+#[tauri::command]
 fn minimize_overlay(app: AppHandle) -> Result<(), String> {
     minimize_main_window(&app)
 }
 
 #[tauri::command]
 fn set_overlay_compact(app: AppHandle, compact: bool) -> Result<(), String> {
-    let window = restore_overlay_window(&app)?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window was not found.".to_string())?;
     let size = if compact {
         LogicalSize {
-            width: 380.0,
-            height: 78.0,
+            width: 366.0,
+            height: 66.0,
         }
     } else {
         LogicalSize {
@@ -300,10 +343,43 @@ fn transcribe_audio(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn remember_foreground_target(app: &AppHandle) {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() || is_overlay_window(app, foreground) {
+        return;
+    }
+
+    let state = app.state::<AppState>();
+    if let Ok(mut target) = state.target_window.lock() {
+        target.replace(foreground.0 as isize);
+    };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn remember_foreground_target(_app: &AppHandle) {}
+
+#[cfg(target_os = "windows")]
+fn is_overlay_window(app: &AppHandle, hwnd: HWND) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.hwnd().ok())
+        .is_some_and(|overlay_hwnd| overlay_hwnd.0 == hwnd.0)
+}
+
 fn restore_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main window was not found.".to_string())?;
+
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+
+    let _ = window.set_always_on_top(true);
     window.show().map_err(|error| error.to_string())?;
     window.unminimize().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())?;
@@ -328,7 +404,7 @@ fn position_compact_overlay(window: &tauri::WebviewWindow) -> Result<(), String>
     let scale_factor = monitor.scale_factor();
     let monitor_size = monitor.size();
     let monitor_position = monitor.position();
-    let width = 380.0;
+    let width = 366.0;
     let top_offset = 176.0;
     let monitor_width = monitor_size.width as f64 / scale_factor;
     let monitor_x = monitor_position.x as f64 / scale_factor;
@@ -357,9 +433,14 @@ fn insert_text(state: State<AppState>, text: String) -> Result<bool, String> {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
                 let _ = SetForegroundWindow(hwnd);
             }
+            thread::sleep(Duration::from_millis(120));
         }
 
         if send_unicode_text(&text) {
+            return Ok(true);
+        }
+
+        if paste_text_via_clipboard(&text)? {
             return Ok(true);
         }
 
@@ -748,7 +829,7 @@ fn default_settings() -> AppSettings {
         transcription_mode: TranscriptionMode::Hybrid,
         cloud_provider: "openai".to_string(),
         api_key: String::new(),
-        auto_insert: false,
+        auto_insert: true,
     }
 }
 
@@ -853,26 +934,48 @@ fn send_unicode_text(text: &str) -> bool {
     }
 
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent == inputs.len() as u32 {
-        return true;
-    }
-
-    post_chars(text)
+    sent == inputs.len() as u32
 }
 
 #[cfg(target_os = "windows")]
-fn post_chars(text: &str) -> bool {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() {
-        return false;
-    }
+fn paste_text_via_clipboard(text: &str) -> Result<bool, String> {
+    let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| error.to_string())?;
 
-    for unit in text.encode_utf16() {
-        let result = unsafe { PostMessageW(Some(hwnd), WM_CHAR, WPARAM(unit as usize), LPARAM(0)) };
-        if result.is_err() {
-            return false;
-        }
-    }
+    thread::sleep(Duration::from_millis(40));
+    Ok(send_ctrl_v())
+}
 
-    true
+#[cfg(target_os = "windows")]
+fn send_ctrl_v() -> bool {
+    const VK_CONTROL: VIRTUAL_KEY = VIRTUAL_KEY(0x11);
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+
+    let inputs = [
+        key_input(VK_CONTROL, KEYBD_EVENT_FLAGS(0)),
+        key_input(VK_V, KEYBD_EVENT_FLAGS(0)),
+        key_input(VK_V, KEYEVENTF_KEYUP),
+        key_input(VK_CONTROL, KEYEVENTF_KEYUP),
+    ];
+
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    sent == inputs.len() as u32
+}
+
+#[cfg(target_os = "windows")]
+fn key_input(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }

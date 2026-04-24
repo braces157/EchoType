@@ -6,6 +6,7 @@ import sys
 
 _MODEL = None
 _MODEL_NAME = None
+_PIPELINE = None
 
 
 def env_int(name: str, default: int) -> int:
@@ -27,11 +28,12 @@ def default_model(language: str) -> str:
 def load_model(model_name: str):
     global _MODEL
     global _MODEL_NAME
+    global _PIPELINE
 
     if _MODEL is not None and _MODEL_NAME == model_name:
-        return _MODEL
+        return _PIPELINE or _MODEL
 
-    from faster_whisper import WhisperModel
+    from faster_whisper import BatchedInferencePipeline, WhisperModel
 
     _MODEL = WhisperModel(
         model_name,
@@ -39,21 +41,24 @@ def load_model(model_name: str):
         compute_type=os.environ.get("ECHOTYPE_WHISPER_COMPUTE_TYPE", "int8"),
         cpu_threads=env_int("ECHOTYPE_WHISPER_CPU_THREADS", 0),
     )
+    _PIPELINE = BatchedInferencePipeline(model=_MODEL)
     _MODEL_NAME = model_name
-    return _MODEL
+    return _PIPELINE
 
 
 def transcribe(audio_file: str, language_arg: str) -> str:
     model_name = os.environ.get("ECHOTYPE_WHISPER_MODEL", default_model(language_arg))
     language = None if language_arg == "auto" else language_arg
     beam_size = env_int("ECHOTYPE_WHISPER_BEAM_SIZE", 1)
+    batch_size = env_int("ECHOTYPE_WHISPER_BATCH_SIZE", 8)
     vad_filter = os.environ.get("ECHOTYPE_WHISPER_VAD", "0") == "1"
 
-    model = load_model(model_name)
-    segments, _info = model.transcribe(
+    pipeline = load_model(model_name)
+    segments, _info = pipeline.transcribe(
         audio_file,
         language=language,
         beam_size=beam_size,
+        batch_size=batch_size,
         vad_filter=vad_filter,
     )
     return " ".join(segment.text.strip() for segment in segments).strip()

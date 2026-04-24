@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle,
   ClipboardText,
@@ -52,7 +52,7 @@ const defaultSettings: AppSettings = {
   transcriptionMode: "hybrid",
   cloudProvider: "openai",
   apiKey: "",
-  autoInsert: false,
+  autoInsert: true,
 };
 
 const languages = [
@@ -73,7 +73,9 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
     if (command === "load_settings") return defaultSettings as T;
     if (command === "save_settings") return undefined as T;
     if (command === "register_hotkey") return undefined as T;
+    if (command === "capture_active_window") return undefined as T;
     if (command === "reset_webview_permissions") return true as T;
+    if (command === "show_overlay") return undefined as T;
     if (command === "minimize_overlay") return undefined as T;
     if (command === "set_overlay_compact") return undefined as T;
     if (command === "transcribe_audio") {
@@ -111,10 +113,18 @@ function App() {
   const [isCompact, setIsCompact] = useState(false);
   const [isInsertBlocked, setIsInsertBlocked] = useState(false);
   const [hotkeyDraft, setHotkeyDraft] = useState(defaultSettings.hotkey);
+  const [isCapturingHotkey, setIsCapturingHotkey] = useState(false);
+  const [hotkeyCaptureError, setHotkeyCaptureError] = useState("");
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef(0);
   const cancelSessionRef = useRef(false);
+  const isStartingRef = useRef(false);
+  const isStoppingRef = useRef(false);
+  const listenStateRef = useRef<ListenState>("idle");
+  const isSettingsOpenRef = useRef(false);
+  const isCapturingHotkeyRef = useRef(false);
+  const hotkeyHandlerRef = useRef<() => void>(() => undefined);
 
   const statusLabel = useMemo(() => {
     if (listenState === "listening") return isCompact ? "Listening..." : "Listening";
@@ -179,6 +189,18 @@ function App() {
   }, [listenState]);
 
   useEffect(() => {
+    listenStateRef.current = listenState;
+  }, [listenState]);
+
+  useEffect(() => {
+    isSettingsOpenRef.current = isSettingsOpen;
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
+    isCapturingHotkeyRef.current = isCapturingHotkey;
+  }, [isCapturingHotkey]);
+
+  useEffect(() => {
     invokeCommand("register_hotkey", { hotkey: settings.hotkey }).catch(() => {
       setError("This shortcut could not be registered. Choose another keybind in settings.");
       setListenState("error");
@@ -200,9 +222,18 @@ function App() {
     }
   }, []);
 
+  const showOverlay = useCallback(async () => {
+    if (isTauriRuntime()) {
+      await invokeCommand("show_overlay");
+    }
+  }, []);
+
   const stopRecorder = useCallback(() => {
+    if (isStoppingRef.current) return;
+
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== "inactive") {
+      isStoppingRef.current = true;
       if (recorder.state === "recording") {
         recorder.requestData();
       }
@@ -224,9 +255,12 @@ function App() {
   }, [transcript]);
 
   const processAudio = useCallback(
-    async (audioBlob: Blob) => {
+    async (audioBlob: Blob, sessionId: number) => {
+      if (sessionRef.current !== sessionId) return;
+
       setListenState("processing");
       setError("");
+      void minimizeOverlay();
 
       try {
         if (audioBlob.size < 1200) {
@@ -243,12 +277,17 @@ function App() {
           },
         });
 
+        if (sessionRef.current !== sessionId) return;
+
         setTranscript(result.text);
         setEngine(result.engine);
         await copyTextToClipboard(result.text);
 
+        if (sessionRef.current !== sessionId) return;
+
         if (settings.autoInsert) {
           const inserted = await invokeCommand<boolean>("insert_text", { text: result.text });
+          if (sessionRef.current !== sessionId) return;
           setIsInsertBlocked(!inserted);
           setListenState(inserted ? "success" : "error");
           if (!inserted) setError("Saved to clipboard. Active app would not accept typed text.");
@@ -263,22 +302,29 @@ function App() {
         setError(formatUnknownError(cause, "Transcription failed."));
       }
     },
-    [isCompact, setOverlayMode, settings.autoInsert, settings.language, settings.transcriptionMode],
+    [isCompact, minimizeOverlay, setOverlayMode, settings.autoInsert, settings.language, settings.transcriptionMode],
   );
 
   const startListening = useCallback(async () => {
-    if (listenState === "listening") {
+    const activeRecorder = recorderRef.current;
+    if (activeRecorder && activeRecorder.state !== "inactive") {
       stopRecorder();
       return;
     }
 
-    if (listenState === "paused") {
-      pauseRecorder(recorderRef.current);
+    if (isStartingRef.current || listenStateRef.current === "processing") {
+      return;
+    }
+
+    if (listenStateRef.current === "paused") {
+      if (!resumeRecorder(recorderRef.current)) return;
       setListenState("listening");
       return;
     }
 
     try {
+      isStartingRef.current = true;
+
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("This WebView does not expose navigator.mediaDevices.getUserMedia. Run EchoType through Tauri or a secure localhost browser.");
       }
@@ -320,13 +366,14 @@ function App() {
       };
 
       recorder.onstop = () => {
+        isStoppingRef.current = false;
         stream.getTracks().forEach((track) => track.stop());
         if (recorderRef.current === recorder) recorderRef.current = null;
         if (streamRef.current === stream) streamRef.current = null;
         if (cancelSessionRef.current || sessionRef.current !== sessionId) return;
 
         const audioBlob = new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" });
-        void processAudio(audioBlob);
+        void processAudio(audioBlob, sessionId);
       };
 
       recorder.start(250);
@@ -335,8 +382,10 @@ function App() {
       setListenState("error");
       void refreshMicrophoneStatus();
       setError(getMicrophoneErrorMessage(cause));
+    } finally {
+      isStartingRef.current = false;
     }
-  }, [listenState, processAudio, refreshMicrophoneStatus, stopRecorder]);
+  }, [processAudio, refreshMicrophoneStatus, stopRecorder]);
 
   const resetWebviewPermissions = useCallback(async () => {
     try {
@@ -348,24 +397,63 @@ function App() {
     }
   }, [refreshMicrophoneStatus]);
 
+  const handleHotkeyTriggered = useCallback(async () => {
+    if (isSettingsOpenRef.current || isCapturingHotkeyRef.current) {
+      return;
+    }
+
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      stopRecorder();
+      return;
+    }
+
+    if (isStartingRef.current || listenStateRef.current === "processing") {
+      return;
+    }
+
+    await invokeCommand("capture_active_window");
+    await showOverlay();
+    await setOverlayMode(true);
+    await startListening();
+  }, [setOverlayMode, showOverlay, startListening, stopRecorder]);
+
+  useEffect(() => {
+    hotkeyHandlerRef.current = () => {
+      void handleHotkeyTriggered();
+    };
+  }, [handleHotkeyTriggered]);
+
   useEffect(() => {
     if (!isTauriRuntime()) return;
 
-    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    let unlistenHotkey: (() => void) | undefined;
+    let unlistenShowNormal: (() => void) | undefined;
     import("@tauri-apps/api/event")
-      .then(({ listen }) =>
-        listen("hotkey-triggered", async () => {
-          await setOverlayMode(true);
-          await startListening();
-        }),
-      )
-      .then((cleanup) => {
-        unlisten = cleanup;
+      .then(async ({ listen }) => {
+        const cleanupHotkey = await listen("hotkey-triggered", () => hotkeyHandlerRef.current());
+        const cleanupShowNormal = await listen("show-normal-overlay", () => {
+          setIsCompact(false);
+          setIsSettingsOpen(false);
+        });
+
+        if (disposed) {
+          cleanupHotkey();
+          cleanupShowNormal();
+        } else {
+          unlistenHotkey = cleanupHotkey;
+          unlistenShowNormal = cleanupShowNormal;
+        }
       })
       .catch(() => undefined);
 
-    return () => unlisten?.();
-  }, [setOverlayMode, startListening]);
+    return () => {
+      disposed = true;
+      unlistenHotkey?.();
+      unlistenShowNormal?.();
+    };
+  }, []);
 
   const pauseListening = useCallback(() => {
     if (pauseRecorder(recorderRef.current)) {
@@ -388,6 +476,8 @@ function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     recorderRef.current = null;
     streamRef.current = null;
+    isStartingRef.current = false;
+    isStoppingRef.current = false;
     setListenState("idle");
     setSeconds(0);
     setTranscript("");
@@ -396,8 +486,46 @@ function App() {
   }, [setOverlayMode]);
 
   const applyHotkeyDraft = useCallback(async () => {
-    await saveSettings({ ...settings, hotkey: hotkeyDraft.trim() || defaultSettings.hotkey });
+    const nextHotkey = hotkeyDraft.trim() || defaultSettings.hotkey;
+    if (!isSupportedHotkey(nextHotkey)) {
+      setHotkeyCaptureError("Use Ctrl, Alt, Shift, or Win with A-Z, F1-F12, Space, Enter, or Tab.");
+      return;
+    }
+
+    setHotkeyCaptureError("");
+    setIsCapturingHotkey(false);
+    await saveSettings({ ...settings, hotkey: nextHotkey });
   }, [hotkeyDraft, saveSettings, settings]);
+
+  const startHotkeyCapture = useCallback(() => {
+    setIsCapturingHotkey(true);
+    setHotkeyCaptureError("");
+  }, []);
+
+  const captureHotkey = useCallback((event: KeyboardEvent<HTMLInputElement>) => {
+    if (!isCapturingHotkey) return;
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setHotkeyDraft(settings.hotkey);
+      setHotkeyCaptureError("");
+      setIsCapturingHotkey(false);
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const nextHotkey = formatHotkeyEvent(event);
+    if (!nextHotkey) {
+      setHotkeyCaptureError("Use Ctrl, Alt, Shift, or Win with A-Z, F1-F12, Space, Enter, or Tab.");
+      return;
+    }
+
+    setHotkeyDraft(nextHotkey);
+    setHotkeyCaptureError("");
+    setIsCapturingHotkey(false);
+  }, [isCapturingHotkey, settings.hotkey]);
 
   const openSettings = useCallback(() => {
     void setOverlayMode(false);
@@ -550,13 +678,26 @@ function App() {
 
             <label className="field wide">
               <span>Global keybind</span>
-              <div className="hotkey-row">
+              <div className={`hotkey-row ${isCapturingHotkey ? "capturing" : ""}`}>
                 <Keyboard />
-                <input value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} placeholder="Alt+Space" />
+                <input
+                  aria-describedby="hotkey-capture-hint"
+                  aria-label="Capture global keybind"
+                  readOnly
+                  value={isCapturingHotkey ? "Press a key combination..." : hotkeyDraft}
+                  onBlur={() => setIsCapturingHotkey(false)}
+                  onClick={startHotkeyCapture}
+                  onFocus={startHotkeyCapture}
+                  onKeyDown={captureHotkey}
+                  placeholder="Alt+Space"
+                />
                 <button type="button" onClick={applyHotkeyDraft}>
                   Save keybind
                 </button>
               </div>
+              <small id="hotkey-capture-hint" className={hotkeyCaptureError ? "hotkey-hint error" : "hotkey-hint"}>
+                {hotkeyCaptureError || "Click the field, press a shortcut, then save it."}
+              </small>
             </label>
 
             <label className="toggle-row wide">
@@ -663,6 +804,45 @@ function getPreviewText(listenState: ListenState) {
   if (listenState === "error") return "Review the message below, then try again.";
   if (listenState === "paused") return "Recording is paused.";
   return "Speak naturally. EchoType is capturing your voice.";
+}
+
+function formatHotkeyEvent(event: KeyboardEvent<HTMLInputElement>) {
+  const key = getSupportedHotkeyKey(event);
+  if (!key) return "";
+
+  const modifiers: string[] = [];
+  if (event.ctrlKey) modifiers.push("Ctrl");
+  if (event.altKey) modifiers.push("Alt");
+  if (event.shiftKey) modifiers.push("Shift");
+  if (event.metaKey) modifiers.push("Win");
+
+  if (modifiers.length === 0) return "";
+  return [...modifiers, key].join("+");
+}
+
+function getSupportedHotkeyKey(event: KeyboardEvent<HTMLInputElement>) {
+  if (/^Key[A-Z]$/.test(event.code)) return event.code.slice(3);
+  if (/^F(?:[1-9]|1[0-2])$/.test(event.key)) return event.key.toUpperCase();
+
+  switch (event.key) {
+    case " ":
+    case "Spacebar":
+      return "Space";
+    case "Enter":
+    case "Tab":
+      return event.key;
+    default:
+      return "";
+  }
+}
+
+function isSupportedHotkey(hotkey: string) {
+  const tokens = hotkey.split("+").map((part) => part.trim()).filter(Boolean);
+  if (tokens.length < 2) return false;
+
+  const modifiers = new Set(["ctrl", "control", "alt", "shift", "cmd", "win", "super"]);
+  const key = tokens[tokens.length - 1].toLowerCase();
+  return tokens.slice(0, -1).every((token) => modifiers.has(token.toLowerCase())) && /^(?:[a-z]|f(?:[1-9]|1[0-2])|space|enter|tab)$/.test(key);
 }
 
 async function blobToBase64(blob: Blob) {

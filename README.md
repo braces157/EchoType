@@ -73,10 +73,12 @@ Useful local tuning options:
 # Faster, lower accuracy
 $env:ECHOTYPE_WHISPER_MODEL = "tiny.en"
 $env:ECHOTYPE_WHISPER_BEAM_SIZE = "1"
+$env:ECHOTYPE_WHISPER_BATCH_SIZE = "8"
 
 # Better English accuracy, slower
 $env:ECHOTYPE_WHISPER_MODEL = "small.en"
 $env:ECHOTYPE_WHISPER_BEAM_SIZE = "1"
+$env:ECHOTYPE_WHISPER_BATCH_SIZE = "8"
 
 # Try this if recordings include long silence
 $env:ECHOTYPE_WHISPER_VAD = "1"
